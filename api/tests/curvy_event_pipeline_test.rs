@@ -18,16 +18,12 @@ use blokli_chain_rpc::{
 use blokli_chain_types::{AlloyAddressExt, ContractAddresses};
 use blokli_db::{BlokliDbGeneralModelOperations, TargetDb, db::BlokliDb};
 use blokli_db_entity::{
-    chain_info, curvy_commitment_gas_cost, curvy_commitment_gas_fee_root, curvy_committed_note,
-    curvy_committed_nullifier, curvy_pending_note, curvy_token_registration,
+    chain_info, curvy_committed_note, curvy_committed_nullifier, curvy_pending_note, curvy_sync_checkpoint,
 };
 use curvy_bindings::{
     config::CurvyContractInstances,
     constants::DEV_PORTAL_DEPLOYMENT_FEE,
-    curvy_aggregator_alpha_v2::CurvyAggregatorAlphaV2::{
-        CommitmentGasFeeRootUpdated, CommittedNotes, CommittedNullifiers, PendingNotes,
-    },
-    curvy_vault_v2::CurvyVaultV2::{CommitmentGasCostsUpdated, TokenRegistration},
+    curvy_aggregator_alpha_v2::CurvyAggregatorAlphaV2::{CommittedNotes, CommittedNullifiers, PendingNotes},
     portal_factory::CurvyTypes::Note,
 };
 use futures::StreamExt;
@@ -48,12 +44,16 @@ use hopr_types::primitive::{
     prelude::{Address, SerializableLog},
     traits::ToHex,
 };
-use sea_orm::{ActiveModelTrait, EntityTrait, PaginatorTrait, Set};
+use sea_orm::{ActiveModelTrait, EntityTrait, PaginatorTrait, QueryOrder, Set};
 use serde_json::{Value, json};
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 type CurvySchema = Schema<QueryRoot, EmptyMutation, SubscriptionRoot>;
+
+fn hex32(value: U256) -> String {
+    format!("{value:#066x}")
+}
 
 fn logs_with_signature(logs: &[Log], signature: B256) -> Vec<Log> {
     logs.iter()
@@ -182,7 +182,7 @@ async fn test_curvy_events_are_indexed_and_streamed() -> anyhow::Result<()> {
 
     let latest_block = provider.get_block_number().await?;
     let filter = Filter::new()
-        .address(vec![curvy_addresses.aggregator_proxy, curvy_addresses.vault_proxy])
+        .address(curvy_addresses.aggregator_proxy)
         .from_block(0)
         .to_block(latest_block);
     let chain_logs = provider
@@ -227,81 +227,14 @@ async fn test_curvy_events_are_indexed_and_streamed() -> anyhow::Result<()> {
         .data(indexer_state.clone())
         .data(GasMultiplier(1.0))
         .finish();
-    let handlers = ContractEventHandlers::new(contract_addresses, db.clone(), rpc_operations, indexer_state, true);
-
-    let token_logs = logs_with_signature(&chain_logs, TokenRegistration::SIGNATURE_HASH);
-    anyhow::ensure!(
-        !token_logs.is_empty(),
-        "Curvy deployment did not emit TokenRegistration"
+    let handlers = ContractEventHandlers::new(
+        contract_addresses,
+        db.clone(),
+        rpc_operations,
+        indexer_state,
+        true,
+        true,
     );
-    let mut expected_token_registrations = Vec::new();
-    for log in &token_logs {
-        let event = decode_event::<TokenRegistration>(log)?;
-        let expected = json!({
-            "position": event_position(log, 0),
-            "tokenAddress": event.token_address.to_hopr_address().to_hex(),
-            "tokenId": event.token_id.to_string(),
-        });
-        assert_live_events(
-            &schema,
-            r#"subscription { curvyTokenRegistered { position { block eventItemIndex logIndex transactionHash transactionIndex } tokenAddress tokenId } }"#,
-            "curvyTokenRegistered",
-            std::slice::from_ref(&expected),
-            handlers.collect_log_event(SerializableLog::from(log.clone()), true),
-        )
-        .await?;
-        expected_token_registrations.push(expected);
-    }
-
-    let gas_root_logs = logs_with_signature(&chain_logs, CommitmentGasFeeRootUpdated::SIGNATURE_HASH);
-    anyhow::ensure!(
-        gas_root_logs.len() == 1,
-        "expected one CommitmentGasFeeRootUpdated event"
-    );
-    let gas_root_log = &gas_root_logs[0];
-    let gas_root_event = decode_event::<CommitmentGasFeeRootUpdated>(gas_root_log)?;
-    let expected_gas_root = json!({
-        "position": event_position(gas_root_log, 0),
-        "root": gas_root_event.root.to_string(),
-    });
-    assert_live_events(
-        &schema,
-        r#"subscription { curvyCommitmentGasFeeRootUpdated { position { block eventItemIndex logIndex transactionHash transactionIndex } root } }"#,
-        "curvyCommitmentGasFeeRootUpdated",
-        std::slice::from_ref(&expected_gas_root),
-        handlers.collect_log_event(SerializableLog::from(gas_root_log.clone()), true),
-    )
-    .await?;
-
-    let gas_cost_logs = logs_with_signature(&chain_logs, CommitmentGasCostsUpdated::SIGNATURE_HASH);
-    anyhow::ensure!(gas_cost_logs.len() == 1, "expected one CommitmentGasCostsUpdated event");
-    let gas_cost_log = &gas_cost_logs[0];
-    let gas_cost_event = decode_event::<CommitmentGasCostsUpdated>(gas_cost_log)?;
-    let expected_gas_costs = gas_cost_event
-        .gasFees
-        .iter()
-        .enumerate()
-        .map(|(item_index, fees)| {
-            json!({
-                "gasFees": {
-                    "pendingNoteCommitment": fees.pendingNoteCommitment.to_string(),
-                    "portalDeployment": fees.portalDeployment.to_string(),
-                    "tokenId": fees.tokenId.to_string(),
-                    "withdrawal": fees.withdrawal.to_string(),
-                },
-                "position": event_position(gas_cost_log, item_index),
-                "root": gas_cost_event.root.to_string(),
-            })
-        })
-        .collect::<Vec<_>>();
-    assert_live_events(
-        &schema,
-        r#"subscription { curvyCommitmentGasCostsUpdated { gasFees { pendingNoteCommitment portalDeployment tokenId withdrawal } position { block eventItemIndex logIndex transactionHash transactionIndex } root } }"#,
-        "curvyCommitmentGasCostsUpdated",
-        &expected_gas_costs,
-        handlers.collect_log_event(SerializableLog::from(gas_cost_log.clone()), true),
-    )
-    .await?;
 
     let pending_logs = logs_with_signature(&chain_logs, PendingNotes::SIGNATURE_HASH);
     anyhow::ensure!(
@@ -322,7 +255,7 @@ async fn test_curvy_events_are_indexed_and_streamed() -> anyhow::Result<()> {
                     pending_event.ephemeralKeys[1][index].to_string(),
                 ],
                 "isPlaintext": pending_event.isPlaintext[index],
-                "noteId": note_id.to_string(),
+                "noteId": hex32(*note_id),
                 "position": event_position(pending_log, index),
                 "tokenId": pending_event.tokens[index].to_string(),
                 "viewTag": pending_event.viewTags[index],
@@ -344,28 +277,30 @@ async fn test_curvy_events_are_indexed_and_streamed() -> anyhow::Result<()> {
             batchIndex: U256::from(6),
             noteIds: vec![U256::from(100)],
         },
-        latest_block,
+        latest_block + 1,
         0x30,
     );
     let committed_notes_event = CommittedNotes {
         batchIndex: U256::from(7),
-        noteIds: vec![U256::from(101), U256::from(102)],
+        noteIds: vec![U256::ZERO, U256::from(101), U256::ZERO, U256::from(102)],
     };
     let committed_notes_log = encoded_event_log(
         contract_addresses.curvy_aggregator,
         &committed_notes_event,
-        latest_block + 1,
+        latest_block + 2,
         0x31,
     );
     let expected_committed_notes = committed_notes_event
         .noteIds
         .iter()
         .enumerate()
-        .map(|(item_index, note_id)| {
-            json!({
-                "batchIndex": committed_notes_event.batchIndex.to_string(),
-                "noteId": note_id.to_string(),
-                "position": event_position(&Log::from(committed_notes_log.clone()), item_index),
+        .filter_map(|(item_index, note_id)| {
+            (*note_id != U256::ZERO).then(|| {
+                json!({
+                    "batchIndex": hex32(committed_notes_event.batchIndex),
+                    "noteId": hex32(*note_id),
+                    "position": event_position(&Log::from(committed_notes_log.clone()), item_index),
+                })
             })
         })
         .collect::<Vec<_>>();
@@ -373,7 +308,7 @@ async fn test_curvy_events_are_indexed_and_streamed() -> anyhow::Result<()> {
         &schema,
         &format!(
             "subscription {{ curvyCommittedNote(fromBlock: \"{}\") {{ batchIndex noteId position {{ block eventItemIndex logIndex transactionHash transactionIndex }} }} }}",
-            latest_block + 1
+            latest_block + 2
         ),
         "curvyCommittedNote",
         &expected_committed_notes,
@@ -388,23 +323,25 @@ async fn test_curvy_events_are_indexed_and_streamed() -> anyhow::Result<()> {
 
     let committed_nullifiers_event = CommittedNullifiers {
         batchIndex: U256::from(8),
-        nullifiers: vec![U256::from(201), U256::from(202)],
+        nullifiers: vec![U256::from(201), U256::ZERO, U256::from(202)],
     };
     let committed_nullifiers_log = encoded_event_log(
         contract_addresses.curvy_aggregator,
         &committed_nullifiers_event,
-        latest_block + 2,
+        latest_block + 3,
         0x32,
     );
     let expected_committed_nullifiers = committed_nullifiers_event
         .nullifiers
         .iter()
         .enumerate()
-        .map(|(item_index, nullifier)| {
-            json!({
-                "batchIndex": committed_nullifiers_event.batchIndex.to_string(),
-                "nullifier": nullifier.to_string(),
-                "position": event_position(&Log::from(committed_nullifiers_log.clone()), item_index),
+        .filter_map(|(item_index, nullifier)| {
+            (*nullifier != U256::ZERO).then(|| {
+                json!({
+                    "batchIndex": hex32(committed_nullifiers_event.batchIndex),
+                    "nullifier": hex32(*nullifier),
+                    "position": event_position(&Log::from(committed_nullifiers_log.clone()), item_index),
+                })
             })
         })
         .collect::<Vec<_>>();
@@ -421,12 +358,15 @@ async fn test_curvy_events_are_indexed_and_streamed() -> anyhow::Result<()> {
         .execute(
             r#"
                 query {
-                    curvyCommitmentGasCostUpdates(first: 10) { gasFees { pendingNoteCommitment portalDeployment tokenId withdrawal } position { block eventItemIndex logIndex transactionHash transactionIndex } root }
-                    curvyCommitmentGasFeeRootUpdates(first: 10) { position { block eventItemIndex logIndex transactionHash transactionIndex } root }
-                    curvyCommittedNotes(first: 10) { batchIndex noteId position { block eventItemIndex logIndex transactionHash transactionIndex } }
-                    curvyCommittedNullifiers(first: 10) { batchIndex nullifier position { block eventItemIndex logIndex transactionHash transactionIndex } }
-                    curvyPendingNotes(first: 10) { amount ephemeralKey isPlaintext noteId position { block eventItemIndex logIndex transactionHash transactionIndex } tokenId viewTag }
-                    curvyTokenRegistrations(first: 10) { position { block eventItemIndex logIndex transactionHash transactionIndex } tokenAddress tokenId }
+                    curvyCommittedNotes(first: 10) {
+                        ... on CurvyCommittedNotes { notes { batchIndex noteId position { block eventItemIndex logIndex transactionHash transactionIndex } } }
+                    }
+                    curvyCommittedNullifiers(first: 10) {
+                        ... on CurvyCommittedNullifiers { nullifiers { batchIndex nullifier position { block eventItemIndex logIndex transactionHash transactionIndex } } }
+                    }
+                    curvyPendingNotes(first: 10) {
+                        ... on CurvyPendingNotes { notes { amount ephemeralKey isPlaintext noteId position { block eventItemIndex logIndex transactionHash transactionIndex } tokenId viewTag } }
+                    }
                 }
             "#,
         )
@@ -444,13 +384,17 @@ async fn test_curvy_events_are_indexed_and_streamed() -> anyhow::Result<()> {
                         after: {{ block: "{}", transactionIndex: "0", logIndex: "0", eventItemIndex: "0" }}
                         first: 1
                     ) {{
-                        batchIndex
-                        noteId
-                        position {{ block eventItemIndex logIndex transactionHash transactionIndex }}
+                        ... on CurvyCommittedNotes {{
+                            notes {{
+                                batchIndex
+                                noteId
+                                position {{ block eventItemIndex logIndex transactionHash transactionIndex }}
+                            }}
+                        }}
                     }}
                 }}
             "#,
-            latest_block + 1
+            latest_block + 2
         ))
         .await
         .into_result()
@@ -460,38 +404,13 @@ async fn test_curvy_events_are_indexed_and_streamed() -> anyhow::Result<()> {
         cursor_page_response.data.into_json()?
     );
 
-    for log in token_logs {
-        handlers.collect_log_event(SerializableLog::from(log), true).await?;
-    }
-    handlers
-        .collect_log_event(SerializableLog::from(gas_root_log.clone()), true)
-        .await?;
-    handlers
-        .collect_log_event(SerializableLog::from(gas_cost_log.clone()), true)
-        .await?;
     handlers
         .collect_log_event(SerializableLog::from(pending_log.clone()), true)
         .await?;
-    handlers.collect_log_event(committed_notes_log, true).await?;
-    handlers.collect_log_event(committed_nullifiers_log, true).await?;
-    assert_eq!(
-        curvy_token_registration::Entity::find()
-            .count(db.conn(TargetDb::Index))
-            .await?,
-        u64::try_from(expected_token_registrations.len())?
-    );
-    assert_eq!(
-        curvy_commitment_gas_fee_root::Entity::find()
-            .count(db.conn(TargetDb::Index))
-            .await?,
-        1
-    );
-    assert_eq!(
-        curvy_commitment_gas_cost::Entity::find()
-            .count(db.conn(TargetDb::Index))
-            .await?,
-        u64::try_from(expected_gas_costs.len())?
-    );
+    handlers.collect_log_event(committed_notes_log.clone(), true).await?;
+    handlers
+        .collect_log_event(committed_nullifiers_log.clone(), true)
+        .await?;
     assert_eq!(
         curvy_pending_note::Entity::find()
             .count(db.conn(TargetDb::Index))
@@ -511,6 +430,147 @@ async fn test_curvy_events_are_indexed_and_streamed() -> anyhow::Result<()> {
             .await?,
         u64::try_from(expected_committed_nullifiers.len())?,
         "replaying a CommittedNullifiers log must not duplicate its rows"
+    );
+
+    curvy_pending_note::ActiveModel {
+        note_id: Set(U256::from(101).to_be_bytes::<32>().to_vec()),
+        ephemeral_key_x: Set(U256::from(501).to_be_bytes::<32>().to_vec()),
+        ephemeral_key_y: Set(U256::from(502).to_be_bytes::<32>().to_vec()),
+        view_tag: Set(7),
+        token_id: Set(U256::ONE.to_be_bytes::<32>().to_vec()),
+        amount: Set(U256::from(503).to_be_bytes::<32>().to_vec()),
+        is_plaintext: Set(false),
+        event_item_index: Set(0),
+        chain_tx_hash: Set(vec![0x40; 32]),
+        published_block: Set(i64::try_from(latest_block + 1)?),
+        published_tx_index: Set(0),
+        published_log_index: Set(0),
+        block_hash: Set(vec![0x41; 32]),
+        ..Default::default()
+    }
+    .insert(db.conn(TargetDb::Index))
+    .await?;
+
+    let checkpoint_log = Log::from(committed_nullifiers_log.clone());
+    let checkpoint_hash = checkpoint_log.block_hash.to_hex();
+    let sync_response = schema
+        .execute(format!(
+            r#"
+                query {{
+                    curvySyncCheckpoint {{
+                        ... on CurvySyncCheckpoint {{
+                            blockNumber
+                            blockHash
+                            treeVersion
+                            treeDepth
+                            shardHeight
+                            shardSize
+                            noteCount
+                            nullifierCount
+                            shardCount
+                        }}
+                    }}
+                    curvySyncNotes(checkpoint: "{checkpoint_hash}", fromIndex: "1", first: 1) {{
+                        ... on CurvySyncNotePage {{
+                            checkpoint
+                            nextIndex
+                            total
+                            notes {{
+                                leafIndex
+                                noteId
+                                batchIndex
+                                announcement {{ noteId }}
+                                commitPosition {{ block blockHash eventItemIndex }}
+                            }}
+                        }}
+                    }}
+                    curvySyncNullifiers(checkpoint: "{checkpoint_hash}", fromIndex: "1", first: 1) {{
+                        ... on CurvySyncNullifierPage {{
+                            checkpoint
+                            nextIndex
+                            total
+                            nullifiers {{ nullifier nullifierIndex }}
+                        }}
+                    }}
+                    curvyShardRoots(checkpoint: "{checkpoint_hash}", first: 10) {{
+                        ... on CurvyShardRootPage {{
+                            checkpoint
+                            nextIndex
+                            total
+                            shardRoots {{ shardIndex root }}
+                        }}
+                    }}
+                }}
+            "#,
+        ))
+        .await
+        .into_result()
+        .map_err(|errors| anyhow::anyhow!("GraphQL Curvy sync query errors: {errors:?}"))?;
+    assert_eq!(
+        sync_response.data.into_json()?,
+        json!({
+            "curvySyncCheckpoint": {
+                "blockNumber": checkpoint_log.block_number.to_string(),
+                "blockHash": checkpoint_hash,
+                "treeVersion": 1,
+                "treeDepth": 30,
+                "shardHeight": 14,
+                "shardSize": "16384",
+                "noteCount": "3",
+                "nullifierCount": "2",
+                "shardCount": "0",
+            },
+            "curvySyncNotes": {
+                "checkpoint": checkpoint_log.block_hash.to_hex(),
+                "nextIndex": "2",
+                "total": "3",
+                "notes": [{
+                    "leafIndex": "1",
+                    "noteId": hex32(U256::from(101)),
+                    "batchIndex": hex32(U256::from(7)),
+                    "announcement": { "noteId": hex32(U256::from(101)) },
+                    "commitPosition": {
+                        "block": (latest_block + 2).to_string(),
+                        "blockHash": Log::from(committed_notes_log.clone()).block_hash.to_hex(),
+                        "eventItemIndex": "1",
+                    },
+                }],
+            },
+            "curvySyncNullifiers": {
+                "checkpoint": checkpoint_log.block_hash.to_hex(),
+                "nextIndex": "2",
+                "total": "2",
+                "nullifiers": [{
+                    "nullifier": hex32(U256::from(202)),
+                    "nullifierIndex": "1",
+                }],
+            },
+            "curvyShardRoots": {
+                "checkpoint": checkpoint_log.block_hash.to_hex(),
+                "nextIndex": "0",
+                "total": "0",
+                "shardRoots": [],
+            },
+        })
+    );
+
+    handlers.revert_block_derived_state(latest_block + 3).await?;
+    assert_eq!(
+        curvy_committed_nullifier::Entity::find()
+            .count(db.conn(TargetDb::Index))
+            .await?,
+        0,
+        "reorg rollback must remove the reverted nullifier suffix"
+    );
+    let retained_checkpoint = curvy_sync_checkpoint::Entity::find()
+        .order_by_desc(curvy_sync_checkpoint::Column::BlockNumber)
+        .one(db.conn(TargetDb::Index))
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("retained Curvy checkpoint is missing"))?;
+    assert_eq!(
+        retained_checkpoint.block_number,
+        i64::try_from(latest_block + 2)?,
+        "reorg rollback must restore the preceding atomic checkpoint"
     );
 
     Ok(())
